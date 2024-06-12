@@ -1,7 +1,10 @@
 from datetime import datetime
 from uuid import uuid4
-from fastapi import APIRouter, Body, HTTPException, status
+from fastapi import APIRouter, Body, HTTPException, Query, status
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from pydantic import UUID4
+from fastapi_pagination import Page, paginate
 
 from workout_api.atleta.schemas import AtletaIn, AtletaOut, AtletaUpdate
 from workout_api.atleta.models import AtletaModel
@@ -10,6 +13,9 @@ from workout_api.centro_treinamento.models import CentroTreinamentoModel
 
 from workout_api.contrib.dependencies import DatabaseDependency
 from sqlalchemy.future import select
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -54,7 +60,14 @@ async def post(
         
         db_session.add(atleta_model)
         await db_session.commit()
-    except Exception:
+    except IntegrityError as e:
+        logger.error(f"IntegrityError: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_303_SEE_OTHER,
+            detail=f"Já existe um atleta cadastrado com o cpf: {atleta_model.cpf}",
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail='Ocorreu um erro ao inserir os dados no banco'
@@ -64,35 +77,67 @@ async def post(
 
 
 @router.get(
+    '/all',  # Alteração para evitar conflitos de rota
+    summary='Consultar todos os Atletas com Paginação',
+    status_code=status.HTTP_200_OK,
+    response_model=Page[AtletaOut]
+)
+async def query_with_pagination(
+    db_session: DatabaseDependency,
+    limit: int = Query(10, description='Número máximo de itens por página'),
+    offset: int = Query(0, description='Número de itens para pular')
+):
+    query = select(AtletaModel)
+
+    atletas = (await db_session.execute(query)).scalars().all()
+    
+    if not atletas:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail='Nenhum atleta encontrado'
+        )
+
+    # Paginar os resultados usando paginate do FastAPI Pagination
+    paginated_atletas = paginate(atletas)
+    
+    return paginated_atletas
+
+@router.get(
     '/', 
     summary='Consultar todos os Atletas',
     status_code=status.HTTP_200_OK,
-    response_model=list[AtletaOut],
 )
-async def query(db_session: DatabaseDependency) -> list[AtletaOut]:
-    atletas: list[AtletaOut] = (await db_session.execute(select(AtletaModel))).scalars().all()
+async def query(
+    db_session: DatabaseDependency,
+    nome: str = Query(None, description='Filtrar por nome do atleta'),
+    cpf: str = Query(None, description='Filtrar por CPF do atleta')
+):
+    query = select(AtletaModel)
+    if nome:
+        query = query.filter(AtletaModel.nome == nome)
+    if cpf:
+        query = query.filter(AtletaModel.cpf == cpf)
+
+    atletas = (await db_session.execute(query)).scalars().all()
     
-    return [AtletaOut.model_validate(atleta) for atleta in atletas]
-
-
-@router.get(
-    '/{id}', 
-    summary='Consulta um Atleta pelo id',
-    status_code=status.HTTP_200_OK,
-    response_model=AtletaOut,
-)
-async def get(id: UUID4, db_session: DatabaseDependency) -> AtletaOut:
-    atleta: AtletaOut = (
-        await db_session.execute(select(AtletaModel).filter_by(id=id))
-    ).scalars().first()
-
-    if not atleta:
+    if not atletas:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, 
-            detail=f'Atleta não encontrado no id: {id}'
+            detail='Nenhum atleta encontrado com os critérios fornecidos'
         )
+
+    response_data = [
+        {
+            "id": str(atleta.id),  
+            "created_at": atleta.created_at.isoformat(),  
+            "nome": atleta.nome,
+            "centro_treinamento": atleta.centro_treinamento.nome,
+            "categoria": atleta.categoria.nome
+        }
+        for atleta in atletas
+    ]
     
-    return atleta
+    return JSONResponse(content=response_data)
 
 
 @router.patch(
